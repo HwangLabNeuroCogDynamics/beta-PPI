@@ -3,7 +3,7 @@ Code and examples for the paper: Estimating trial-wise modulation of functional 
 
 ## Overview
 
-This repository provides analysis code for examining how trial wise variables modulate functional connectivity from a behavioral model. The main analysis implements a **beta-series psychophysiological interaction (beta-PPI)** framework that quantifies **trial-by-trial modulation of functional connectivity** by model-derived variables. We performed simulations to test for statistical power, the effects of SNR, and parameter recovery.
+This repository provides analysis code for examining how trial wise variables modulate functional connectivity from a behavioral model. The main analysis implements a beta-series psychophysiological interaction (beta-PPI) framework that quantifies trial-by-trial modulation of functional connectivity by model-derived variables. We performed simulations to test for statistical power, the effects of SNR, and parameter recovery.
 
 The repository includes:
 
@@ -15,7 +15,7 @@ The repository includes:
 
 All analyses were performed using python, with the following tools.
 
-* **Python (≥ 3.8)**
+* Python (≥ 3.8)
   Main environment for simulation.
 
 nilearn: 0.12.1
@@ -24,6 +24,5 @@ statsmodels: 0.14.6
 
 nibabel:5.3.3 
 
-for simulation please check out  and  (for gPPI)
 
 
