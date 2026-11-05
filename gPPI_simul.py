@@ -1,578 +1,356 @@
-"""
-gPPI simulation
+#!/usr/bin/env python3
+""" BSM/PPI simulation for Figure 8
 
-Simulation logic:
------------------
-1. Generate randomized event timing
-2. Simulate latent neural source activity
-3. Generate interaction-driven target activity
-4. Convolve neural activity with HRF
-5. Add AR(1) noise at controlled SNR
-6. Deconvolve source BOLD to estimate neural activity
-7. Build canonical Friston-style gPPI regressor
-8. Fit gPPI model
-9. Estimate recovery / power across simulations
-"""
+Dependencies: numpy, scipy, pandas, joblib, nilearn.
+Both estimators receive identical BOLD signals within each simulated subject.
 
+Example commands used for the main, HRF, and ITI analyses:
+
+python gPPI_fig8_github.py \
+  --hrf variable \
+  --delta 0 0.05 0.1 0.2 0.4 \
+  --bold-snr 0.5 1 1.5 2 \
+  --latent-snr 0.1 0.25 0.5 1 \
+  --source-effect 0.1 0.25 0.5 0.75 \
+  --baseline-coupling 0 0.2 0.4 0.6 \
+  --mean-iti 4.5 \
+  --reps 1000 \
+  --jobs 196 \
+  --batch-size 10 \
+  --condition-chunk 8 \
+  --output fig8_aligned_main
+
+python gPPI_fig8_github.py \
+  --hrf both \
+  --delta 0 0.05 \
+  --bold-snr 0.5 1 1.5 2 \
+  --latent-snr 0.1 0.25 0.5 1 \
+  --source-effect 0.5 \
+  --baseline-coupling 0.2 \
+  --mean-iti 4.5 \
+  --reps 100 \
+  --jobs 256 \
+  --batch-size 10 \
+  --condition-chunk 8 \
+  --output fig8_aligned_hrf2
+
+python gPPI_fig8_github.py \
+  --hrf variable \
+  --delta 0 0.1 \
+  --bold-snr 0.5 1 1.5 2 \
+  --latent-snr 0.1 0.25 0.5 1 \
+  --source-effect 0.5 \
+  --baseline-coupling 0.2 \
+  --mean-iti 1.5 3 4.5 6 \
+  --reps 1000 \
+  --jobs 196 \
+  --batch-size 10 \
+  --condition-chunk 8 \
+  --output fig8_aligned_iti
+
+"""
 import os
-# Limit threading
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-import multiprocessing
+for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(name, "1")
+import argparse
+import itertools
+import time
 import numpy as np
 import pandas as pd
 from scipy import linalg, stats
-from scipy.stats import zscore, gamma
+from scipy.stats import gamma
 from joblib import Parallel, delayed
 from nilearn.glm.first_level import compute_regressor
 
 
-############################################################
-# setup params
-############################################################
-### possible parameters
-TR = [1, 1.5, 2, 3]
-N_TRIALS = [50, 150, 300] # fixed number of trials
-trial_duration = [0.25, 0.5, 1, 2]
-SOURCE_EFFECT_TRUE = [0.1, 0.25, 0.5, 0.75] 
-BASELINE_COUPLING_TRUE = [0.0, 0.2, 0.4, 0.6]
-INTERACTION_TRUE_GRID = [0.0, 0.05, 0.1, 0.2, 0.4]
-BOLD_SNR_GRID = [0.25, 0.5, 1.0, 2.0] 
-LATENT_SNR_GRID = [0.1, 0.25, 0.5, 1.0] 
-N_SUBJECTS = [15, 25, 40]
-# exponential ITIs
-MEAN_ITI = [1, 2, 4, 6]
-# random subject-level HRF variability
-HRF_DELAY_RANGE = 2 # pluse minus peak of 6
-### end of possible parameters
-
-N_REPS = 2 #number of simulations
-N_JOBS = max(1, multiprocessing.cpu_count() // 2)
-OUTPUT_FILE = "gppi_simulation_results.csv"
-DECONV_ALPHA = 0.05
-MICROTIME_RESOLUTION = 10 # for 1 second TR this is about 100 hz
-
-
-############################################################
-# custom hrf function. This is from nilearn SPM
-############################################################
-def custom_spm_hrf( t_r, oversampling=50, time_length=32.0, onset=0.0, delay=6, undershoot=16.0, dispersion=1.0, u_dispersion=1.0, ratio=0.167):
-
-    dt = t_r / oversampling
-    time_stamps = np.linspace( 0, time_length, np.rint(float(time_length) / dt).astype(int), )
-    time_stamps -= onset
-    peak_gamma = gamma.pdf( time_stamps, delay / dispersion, loc=dt, scale=dispersion, )
-    undershoot_gamma = gamma.pdf( time_stamps, undershoot / u_dispersion, loc=dt, scale=u_dispersion, )
-    hrf = peak_gamma - ratio * undershoot_gamma
-    hrf /= hrf.sum()
-
-    return hrf
-
-
-############################################################
-# functions for deconvolution
-# these are modified from
-# Masharipov, R., Knyazeva, I., Korotkov, A., Cherednichenko, D., & Kireev, M. (2024). Comparison of whole-brain task-modulated functional connectivity methods for fMRI task connectomics. Communications biology, 7(1), 1402.
-# see public code at
-#  https://github.com/IHB-IBR-department/TMFC_simulations/blob/main/deconvolution/python/bold_deconvolution.py
-############################################################
-def dctmtx_numpy_vect(N: int, K: int) -> np.ndarray:
-    n = np.arange(N)
-    C = np.zeros((N, K))
-    C[:, 0] = 1 / np.sqrt(N)
-    k = np.arange(1, K)
-    C[:, 1:K] = (
-        np.sqrt(2 / N)
-        *
-        np.cos(np.pi * (2 * n[:, np.newaxis]) * k / (2 * N))
-    )
-
-    return C
-
-
-def compute_xb_Hxb( N, NT, TR, ):
-    # latent res setup
-    # NT = number of microtime bins per TR.
-    # Example:
-    # TR = 2 s
-    # NT = 16
-    # -> dt = 125 ms
-    #
-    # This follows the classical SPM logic where neural
-    # activity is represented at finer temporal resolution
-    # than the observed BOLD sampling rate.
-
-    dt = TR / NT
-    k = np.arange(0, N * NT, NT)
-
-    # Canonical HRF at microtime resolution    
-    # note that
-    # - simulation generation uses subject-specific HRFs
-    # - deconvolution assumes canonical HRF
-
-    hrf = custom_spm_hrf( TR, oversampling=NT, delay=6, )
-
-    # Build discrete cosine basis set
-    #
-    # Instead of directly inverting the BOLD signal,
-    # neural activity is represented as a weighted
-    # combination of smooth cosine basis functions.
-    # Otherwise it is ill posed
-
-    M = N * NT + 128
-    xb = dctmtx_numpy_vect(M, N)
-
-    # Convolve each basis function with HRF
-    # Hxb becomes the forward model relating latent neural
-    # basis coefficients to observed BOLD signal.
-
-    Hxb = np.zeros((N, N))
-
-    for i in range(N):
-        Hx = np.convolve( xb[:, i], hrf, mode='full', )
-        Hxb[:, i] = Hx[k + 128]
-
-    xb = xb[128:, :]
-
-    return xb, Hxb
-
-
-# timeseries deconvolution
-def ridge_regress_deconvolution( BOLD, alpha, xb, Hxb, ):
-
-    # Ridge regression
-    #
-    # Solve:
-    # beta = (H'H + alpha*I)^-1 H'Y
-    # where:
-    #
-    # H = convolved basis set
-    # Y = observed BOLD signal
-
-    C = np.linalg.solve(
-        Hxb.T @ Hxb + alpha * np.eye(Hxb.shape[1]),
-        Hxb.T @ BOLD,
-    )
-
-    # Reconstruct neural signal in microtime resolution
-    neuro = xb @ C
-    return neuro.flatten()
-
-
-############################################################
-# BUILD DESIGN
-############################################################
-
-def build_design_matrices( tr, n_trials, trial_duration_value, mean_iti, ):
-
-    ############################################################
-    # BUILD TIMING
-    ############################################################
-    itis = np.random.exponential(scale=mean_iti, size=n_trials)
-    # should we set minimum ITI?
-    itis = np.maximum(0.5, itis)
-
-    # creat timing
-    all_onsets = []
-    current_time = 0.0
-
-    for iti in itis:
-        current_time += iti
-        all_onsets.append(current_time)
-        current_time += trial_duration_value
-
-    all_onsets = np.array(all_onsets)
-    all_durations = np.ones(n_trials) * trial_duration_value
-    run_duration = all_onsets[-1] + trial_duration_value + 20 # pad a bit at end
-
-    # round up to nearest TR
-    run_duration = np.ceil(run_duration / tr) * tr
-
-    # frame times for nilearn
-    frame_times = np.arange(0, run_duration, tr)
-
-    # Precompute deconv basis set
-    # This is reused across all subjects in a condition,
-    xb, Hxb = compute_xb_Hxb( N=len(frame_times), NT=MICROTIME_RESOLUTION, TR=tr)
-
-    # latent frame times
-    microtime_frame_times = np.arange( 0, run_duration, tr / MICROTIME_RESOLUTION)
-
-    return {
-        "all_onsets": all_onsets,
-        "all_durations": all_durations,
-        "frame_times": frame_times,
-        "microtime_frame_times": microtime_frame_times,
-        "xb": xb,
-        "Hxb": Hxb,
-    }
-
-
-############################################################
-# simulation
-############################################################
-def run_single_rep(
-    interaction_true,
-    bold_snr,
-    latent_snr,
-    n_trials,
-    source_effect_true,
-    baseline_coupling_true,
-    n_subjects,
-    design,
-):
-
-    all_onsets = design["all_onsets"]
-    all_durations = design["all_durations"]
-    frame_times = design["frame_times"]
-    microtime_frame_times = design["microtime_frame_times"]
-    xb = design["xb"] #this is latent activity basis set in (N_latet timepoints, N_basis_functions)
-    Hxb = design["Hxb"] # the above convolved with HRF
-
-    ########################################################
-    # Store subject-level gPPI effects
-    ########################################################
-
-    # Each subject contributes ONE interaction beta
-    # These subject-level betas will later be tested
-    # against zero at the group level.
-
-    interaction_betas = []
-    main_betas = []
-    mod_betas = []
-
-    for subj_idx in range(n_subjects):
-
-        ########################################################
-        # subject-level hrf variability
-        ########################################################
-        src_delay = np.random.uniform(6.0 - HRF_DELAY_RANGE, 6.0 + HRF_DELAY_RANGE)
-        tgt_delay = np.random.uniform(6.0 - HRF_DELAY_RANGE, 6.0 + HRF_DELAY_RANGE)
-
-        #hrf functions for compute regressor
-        def src_hrf(tr, oversampling=50):
-            return custom_spm_hrf(
-                tr,
-                oversampling=oversampling,
-                delay=src_delay,
-            )
-
-        def tgt_hrf(tr, oversampling=50):
-            return custom_spm_hrf(
-                tr,
-                oversampling=oversampling,
-                delay=tgt_delay,
-            )
-
-        ########################################################
-        # Generate latent activity
-        ########################################################
-        '''
-        Dial so the laten signal achieve the latent SNR of
-        y = signal + noise * (std(signal) / latent SNR)
-        '''
-        # create random model variables,
-        # wonder if we should read from real data?
-        moderator = zscore(np.random.randn(n_trials))
-        moderator_signal = source_effect_true * moderator
-
-        source_noise = zscore(np.random.randn(n_trials))
-
-        source_latent = (moderator_signal #this alone is the co activation effect
-            + source_noise * (np.std(moderator_signal) / (latent_snr + 1e-12))) # add noise to source to achieve desired latent SNR
-        
-        ### now construct the target signal
-        interaction_drive = source_latent * moderator
-
-        target_signal_component = (
-            baseline_coupling_true * source_latent   # intrinsic coupling
-            + interaction_true * interaction_drive      # interaction effect
-            + source_effect_true * moderator    # co-activation effect
-        )
-
-        target_noise = zscore(np.random.randn(n_trials))
-        target_latent = (target_signal_component + target_noise * (np.std(target_signal_component) / (latent_snr + 1e-12)))
-
-        ########################################################
-        # HRF convolution
-        ########################################################
-        src_reg, _ = compute_regressor(
-            (all_onsets, all_durations, source_latent),
-            hrf_model=src_hrf,
-            frame_times=frame_times,
-        )
-
-        tgt_reg, _ = compute_regressor(
-            (all_onsets, all_durations, target_latent),
-            hrf_model=tgt_hrf,
-            frame_times=frame_times,
-        )
-
-        psych_reg, _ = compute_regressor(
-            (all_onsets, all_durations, moderator),
-            hrf_model="spm",
-            frame_times=frame_times,
-        ) #this is task regressor
-
-        ########################################################
-        # Psychological regressor at latent resolution
-        # Classical gPPI computes interaction at neural resolution before reconvolution.
-        ########################################################
-        psych_micro_reg, _ = compute_regressor(
-            (all_onsets, all_durations, moderator),
-            hrf_model=None,
-            frame_times=microtime_frame_times,
-        )
-
-        src_signal = src_reg[:, 0]
-        tgt_signal = tgt_reg[:, 0]
-        psych_signal = psych_reg[:, 0]
-        psych_micro_signal = psych_micro_reg[:, 0]
-
-        # Add AR(1) noise
-
-        rho = 0.5
-        src_noise = np.random.randn(len(src_signal))
-        tgt_noise = np.random.randn(len(tgt_signal))
-
-        for i in range(1, len(src_noise)):
-            src_noise[i] += rho * src_noise[i - 1]
-            tgt_noise[i] += rho * tgt_noise[i - 1]
-
-        src_noise = zscore(src_noise)
-        tgt_noise = zscore(tgt_noise)
-
-        # scale SNR
-        y_src = src_signal + src_noise * ( np.std(src_signal) / (bold_snr + 1e-12))
-        y_tgt = tgt_signal + tgt_noise * ( np.std(tgt_signal) / (bold_snr + 1e-12))
-
-        ########################################################
-        # Deconvolution
-        # Estimate latent neural activity from observed BOLD
-        # using ridge-regularized basis regression.
-        # Output neural signal exists in latent resolution.
-        ########################################################
-        source_neural_est = ridge_regress_deconvolution(
-            y_src,
-            alpha=DECONV_ALPHA,
-            xb=xb,
-            Hxb=Hxb,
-        )
-
-        ########################################################
-        # Build PPI-style neural interaction
-        ########################################################
-        source_neural_est = zscore(source_neural_est)
-        psych_micro_signal = zscore(psych_micro_signal)
-        interaction_neural = (source_neural_est * psych_micro_signal )
-
-        ########################################################
-        # Reconvolution
-        ########################################################
-        canonical_hrf = custom_spm_hrf(
-            TR,
-            oversampling=MICROTIME_RESOLUTION,
-            delay=6,
-        )
-
-        ppi_signal_full = np.convolve(
-            interaction_neural,
-            canonical_hrf,
-            mode='full',
-        )
-
-        # Downsample back to TR resolution
-        ppi_signal = ppi_signal_full[ ::MICROTIME_RESOLUTION ][:len(frame_times)]
-
-        ########################################################
-        # Build gPPI model
-        ########################################################
-        X = np.column_stack([
-            zscore(y_src),
-            zscore(psych_signal),
-            zscore(ppi_signal),
-            np.ones(len(frame_times)),
-        ])
-
-        # Subject-level regression
-        #
-        # beta_hat:
-        #
-        # [0] = source main effect (baseline coupling)
-        # [1] = moderator main effect (task effect)
-        # [2] = interaction effect (gPPI)
-        # [3] = intercept
-
-        beta_hat, _, _, _ = linalg.lstsq(X, zscore(y_tgt))
-
-        interaction_betas.append(beta_hat[2])
-        main_betas.append(beta_hat[0])
-        mod_betas.append(beta_hat[1])
-
-    # Group-level statistics
-    interaction_betas = np.array(interaction_betas)
-    main_betas = np.array(main_betas)
-    mod_betas = np.array(mod_betas)
-
-    interaction_t, interaction_p = stats.ttest_1samp( interaction_betas, popmean=0.0, )
-    main_t, main_p = stats.ttest_1samp( main_betas, popmean=0.0, )
-    mod_t, mod_p = stats.ttest_1samp( mod_betas, popmean=0.0, )
-
-    return {
-        "interaction_reject": float(interaction_p < 0.05),
-        "interaction_mean_beta": np.mean(interaction_betas),
-        "interaction_t": interaction_t,
-
-        "main_reject": float(main_p < 0.05),
-        "main_mean_beta": np.mean(main_betas),
-        "main_t": main_t,
-
-        "mod_reject": float(mod_p < 0.05),
-        "mod_mean_beta": np.mean(mod_betas),
-        "mod_t": mod_t,
-    }
-
-
-############################################################
-# run condition
-############################################################
-def run_condition(
-    interaction_true,
-    bold_snr,
-    latent_snr,
-    tr,
-    n_trials,
-    trial_duration_value,
-    source_effect_true,
-    baseline_coupling_true,
-    n_subjects,
-    mean_iti,
-):
-
-    design = build_design_matrices( tr, n_trials, trial_duration_value, mean_iti, )
-
-    rep_results = []
-    for rep in range(N_REPS):
-
-        result = run_single_rep(
-            interaction_true,
-            bold_snr,
-            latent_snr,
-            n_trials,
-            source_effect_true,
-            baseline_coupling_true,
-            n_subjects,
-            design,
-        )
-
-        rep_results.append(result)
-
-    rep_df = pd.DataFrame(rep_results)
-
-    return {
-        "interaction_true": interaction_true,
-        "bold_snr": bold_snr,
-        "latent_snr": latent_snr,
-        "tr": tr,
-        "n_trials": n_trials,
-        "trial_duration": trial_duration_value,
-        "source_effect_true": source_effect_true,
-        "baseline_coupling_true": baseline_coupling_true,
-        "n_subjects": n_subjects,
-        "mean_iti": mean_iti,
-
-        # interaction effect
-        "interaction_power": rep_df["interaction_reject"].mean(),
-        "interaction_mean_beta": rep_df["interaction_mean_beta"].mean(),
-        "interaction_t": rep_df["interaction_t"].mean(),
-
-        # source main effect
-        "main_power": rep_df["main_reject"].mean(),
-        "main_mean_beta": rep_df["main_mean_beta"].mean(),
-        "main_t": rep_df["main_t"].mean(),
-
-        # moderator main effect
-        "mod_power": rep_df["mod_reject"].mean(),
-        "mod_mean_beta": rep_df["mod_mean_beta"].mean(),
-        "mod_t": rep_df["mod_t"].mean(),
-    }
-
-
-############################################################
-# build jobs
-############################################################
-simulation_jobs = [
-    (
-        interaction_true,
-        bold_snr,
-        latent_snr,
-        tr,
-        n_trials,
-        trial_duration_value,
-        source_effect_true,
-        baseline_coupling_true,
-        n_subjects,
-        mean_iti,
-    )
-
-    for interaction_true in INTERACTION_TRUE_GRID
-    for bold_snr in BOLD_SNR_GRID
-    for latent_snr in LATENT_SNR_GRID
-    for tr in [TR]
-    for n_trials in [N_TRIALS]
-    for trial_duration_value in [trial_duration]
-    for source_effect_true in SOURCE_EFFECT_TRUE
-    for baseline_coupling_true in BASELINE_COUPLING_TRUE
-    for n_subjects in [N_SUBJECTS]
-    for mean_iti in [MEAN_ITI]
-]
-
-
-############################################################
-# run simulations
-############################################################
-import time
-
-t0 = time.time()
-
-results = Parallel(
-    n_jobs=N_JOBS,
-    batch_size=4,
-)(
-    delayed(run_condition)(
-        interaction_true,
-        bold_snr,
-        latent_snr,
-        tr,
-        n_trials,
-        trial_duration_value,
-        source_effect_true,
-        baseline_coupling_true,
-        n_subjects,
-        mean_iti,
-    )
-
-    for (
-        interaction_true,
-        bold_snr,
-        latent_snr,
-        tr,
-        n_trials,
-        trial_duration_value,
-        source_effect_true,
-        baseline_coupling_true,
-        n_subjects,
-        mean_iti,
-    ) in simulation_jobs
-)
-
-runtime = time.time() - t0
-
-print("\nBenchmark completed")
-print(f"Runtime: {runtime:.2f} seconds")
-
-results_df = pd.DataFrame(results)
-results_df.to_csv( OUTPUT_FILE, index=False, )
+def zscore(x):
+    x = np.asarray(x, dtype=float)
+    sd = x.std()
+    if sd < 1e-12:
+        return np.zeros_like(x)
+    return (x - x.mean()) / sd
+
+
+def custom_spm_hrf(tr, oversampling=10, time_length=32.0, delay=6.0):
+    # Use the same HRF normalization for data generation and PPI reconvolution.
+    dt = tr / oversampling
+    t = np.linspace(0, time_length, int(np.rint(time_length / dt)))
+    h = gamma.pdf(t, delay, loc=dt, scale=1.0) - 0.167 * gamma.pdf(t, 16.0, loc=dt, scale=1.0)
+    return h / h.sum()
+
+
+def make_design(rng, n_trials, mean_iti, trial_duration, tr):
+    itis = np.maximum(0.5, rng.exponential(mean_iti, size=n_trials))
+    onsets = np.cumsum(itis + trial_duration) - trial_duration
+    durations = np.full(n_trials, trial_duration)
+    duration = np.ceil((onsets[-1] + trial_duration + 20.0) / tr) * tr
+    frames = np.arange(0, duration, tr)
+    return onsets, durations, frames
+
+
+def lss_operator(onsets, durations, frames, method="original"):
+    n = len(onsets)
+    full, _ = compute_regressor((onsets, durations, np.ones(n)), 'spm', frames)
+    full = full[:, 0]
+    intercept = np.ones(len(frames))
+    op = np.empty((n, len(frames)))
+    for i in range(n):
+        reg, _ = compute_regressor((onsets[i:i+1], durations[i:i+1], np.ones(1)), 'spm', frames)
+        target = reg[:, 0]
+        x = np.column_stack((target, full - target, intercept))
+        if method == "original":
+            # Retain the LSS operator used for the reported BSM simulations.
+            op[i] = (linalg.pinv(x.T @ x) @ x.T)[0]
+        elif method == "direct":
+            # used this for some testing only.
+            op[i] = linalg.pinv(x)[0]
+        else:
+            raise ValueError(f"Unknown LSS method: {method}")
+    return op
+
+
+def dct_basis(m, n_basis):
+    """Tried to match the DCT basis method for deconvolution."""
+    row = np.arange(m, dtype=float)[:, None]
+    col = np.arange(1, n_basis, dtype=float)[None, :]
+    basis = np.empty((m, n_basis), dtype=float)
+    basis[:, 0] = 1.0 / np.sqrt(m)
+    basis[:, 1:] = np.sqrt(2.0 / m) * np.cos(np.pi * (2.0 * row + 1.0) * col / (2.0 * m))
+    return basis
+
+
+def deconv_operator(n_scans, tr, microtime, alpha):
+    """Precompute the DCTforward model and ridge for PPI."""
+    n = n_scans
+    pad = 128
+    n_basis = int(np.ceil(n / 4))  # Restrict the neural basis to low-frequency components.
+    basis = dct_basis(n * microtime + pad, n_basis)
+    h = custom_spm_hrf(tr, oversampling=microtime, delay=6)
+    indices = np.arange(n) * microtime + pad
+    hxb = np.empty((n, n_basis), dtype=float)
+    for k in range(n_basis):
+        hxb[:, k] = np.convolve(basis[:, k], h, mode='full')[indices]
+    xb = basis[pad:, :]
+    gram = hxb.T @ hxb + alpha * np.eye(n_basis)
+    factor = linalg.cho_factor(gram, check_finite=False)
+    return xb, hxb, factor
+
+
+def ar1_noise(rng, n, rho):
+    ''' make sure both methods use the same rho.... '''
+    # Original recursive AR(1) process, normalized to sample SD 1.
+    innovations = rng.standard_normal(n)
+    from scipy.signal import lfilter
+    noise = lfilter([1.0], [1.0, -rho], innovations)
+    return zscore(noise)
+
+
+def t_reject(betas, alpha=0.05):
+    t, p = stats.ttest_1samp(betas, 0.0)
+    return float(p < alpha), float(t)
+
+
+def compute_bsm(y_src, y_tgt, mod, op):
+    s = zscore(op @ y_src)
+    t = zscore(op @ y_tgt)
+    m = zscore(mod)
+    x = np.column_stack((s, m, zscore(s*m), np.ones(len(m))))
+    return float(linalg.lstsq(x, t)[0][2])
+
+
+def compute_ppi(y_src, y_tgt, mod, onsets, durations, frames, microframes, tr, microtime, operator):
+    xb, hxb, factor = operator
+    # Estimate a smooth neural source from BOLD using ridge-regularized DCT inversion.
+    weights = linalg.cho_solve(factor, hxb.T @ y_src, check_finite=False)
+    neural = zscore(xb @ weights)
+    psych, _ = compute_regressor((onsets, durations, mod), 'spm', frames)
+    # Multiply the deconvolved source by the un-convolved psychological boxcar.
+    psych_micro, _ = compute_regressor((onsets, durations, mod), None, microframes)
+    product = neural * zscore(psych_micro[:, 0])
+    h = custom_spm_hrf(tr, oversampling=microtime, delay=6)
+    # Sample the reconvolved interaction at the same frame times as observed BOLD.
+    ppi = np.convolve(product, h, mode='full')[::microtime][:len(frames)]
+    x = np.column_stack((zscore(y_src), zscore(psych[:, 0]), zscore(ppi), np.ones(len(frames))))
+    return float(linalg.lstsq(x, zscore(y_tgt))[0][2])
+
+
+def simulate_subject(rng, params, cfg, design, op, deconv):
+    onsets, durations, frames, microframes = design
+    n = len(onsets)
+    m = zscore(rng.standard_normal(n))
+    alpha = params['source_effect']
+    gamma_c = params['baseline_coupling']
+    latent_snr = params['latent_snr']
+    bold_snr = params['bold_snr']
+    delta = params['delta']
+    source_signal = alpha * m
+    source_latent = source_signal + zscore(rng.standard_normal(n)) * (source_signal.std() / latent_snr)
+    target_signal = gamma_c * source_latent + delta * (source_latent * m) + alpha * m
+    target_latent = target_signal + zscore(rng.standard_normal(n)) * (target_signal.std() / latent_snr)
+    if params['hrf'] == 'canonical':
+        src_delay = tgt_delay = 6.0
+    else:
+        src_delay, tgt_delay = rng.uniform(6 - cfg['hrf_delay_range'], 6 + cfg['hrf_delay_range'], size=2)
+    def src_hrf(tr_arg, oversampling=50):
+        return custom_spm_hrf(tr_arg, oversampling=oversampling, delay=src_delay)
+    def tgt_hrf(tr_arg, oversampling=50):
+        return custom_spm_hrf(tr_arg, oversampling=oversampling, delay=tgt_delay)
+    src, _ = compute_regressor((onsets, durations, source_latent), src_hrf, frames)
+    tgt, _ = compute_regressor((onsets, durations, target_latent), tgt_hrf, frames)
+    src = src[:, 0]
+    tgt = tgt[:, 0]
+    rho = params['bold_ar1']
+    y_src = src + ar1_noise(rng, len(src), rho) * (src.std() / bold_snr)
+    y_tgt = tgt + ar1_noise(rng, len(tgt), rho) * (tgt.std() / bold_snr)
+    bsm = compute_bsm(y_src, y_tgt, m, op)
+    ppi = compute_ppi(y_src, y_tgt, m, onsets, durations, frames, microframes, cfg['tr'], cfg['microtime'], deconv)
+    return bsm, ppi
+
+
+def run_batch(params, cfg, rep_indices, master_seed):
+    # Hold the event schedule fixed within each condition and share BOLD data across methods.
+    # Repetition seeds are independent of job scheduling and batch size.
+    # Design is fixed across batches of the same parameter condition.
+    design_rng = np.random.default_rng(np.random.SeedSequence([master_seed, params['condition_id'], 999]))
+    onsets, durations, frames = make_design(design_rng, cfg['n_trials'], params['mean_iti'], cfg['trial_duration'], cfg['tr'])
+    microframes = np.arange(len(frames) * cfg['microtime']) * cfg['tr'] / cfg['microtime']
+    realized_itis = np.diff(np.r_[0.0, onsets]) - np.r_[0.0, durations[:-1]]
+    realized_mean_iti = float(np.mean(realized_itis))
+    design = onsets, durations, frames, microframes
+    op = lss_operator(onsets, durations, frames, cfg["lss_method"])
+    deconv = deconv_operator(len(frames), cfg['tr'], cfg['microtime'], cfg['ridge_alpha'])
+    rows = []
+    for rep in rep_indices:
+        rng = np.random.default_rng(np.random.SeedSequence([master_seed, params['condition_id'], int(rep)]))
+        bsm_betas = []
+        ppi_betas = []
+        for _ in range(cfg['n_subjects']):
+            b, p = simulate_subject(rng, params, cfg, design, op, deconv)
+            bsm_betas.append(b)
+            ppi_betas.append(p)
+        bsm_reject, bsm_t = t_reject(bsm_betas)
+        ppi_reject, ppi_t = t_reject(ppi_betas)
+        rows.append({**params, 'rep': int(rep), 'bsm_reject': bsm_reject,
+                     'ppi_reject': ppi_reject, 'bsm_t': bsm_t, 'ppi_t': ppi_t,
+                     'bsm_mean_beta': float(np.mean(bsm_betas)),
+                     'ppi_mean_beta': float(np.mean(ppi_betas)),
+                     'realized_mean_iti': realized_mean_iti})
+    return rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--reps', type=int, default=1000)
+    parser.add_argument('--jobs', type=int, default=8)
+    parser.add_argument('--batch-size', type=int, default=10)
+    parser.add_argument('--condition-chunk', type=int, default=8,
+                        help='Number of parameter conditions processed and checkpointed together.')
+    parser.add_argument('--seed', type=int, default=20261015)
+    parser.add_argument('--n-subjects', type=int, default=38)
+    parser.add_argument('--n-trials', type=int, default=408)
+    parser.add_argument('--microtime', type=int, default=10)
+    parser.add_argument('--ridge-alpha', type=float, default=0.05)
+    parser.add_argument('--lss-method', choices=['original', 'direct'], default='original',
+                        help='original: pinv(X.T @ X) @ X.T; direct: pinv(X) (diagnostic only)')
+    parser.add_argument('--hrf', choices=['both','canonical','variable'], default='variable')
+    parser.add_argument('--delta', type=float, nargs='+', default=[0, 0.05, 0.1, 0.2, 0.4])
+    parser.add_argument('--bold-snr', type=float, nargs='+', default=[0.5, 1, 1.5, 2])
+    parser.add_argument('--latent-snr', type=float, nargs='+', default=[0.1, 0.25, 0.5, 1])
+    parser.add_argument('--mean-iti', type=float, nargs='+', default=[4.5])
+    parser.add_argument('--source-effect', type=float, nargs='+', default=[0.1, 0.25, 0.5, 0.75])
+    parser.add_argument('--baseline-coupling', type=float, nargs='+', default=[0, 0.2, 0.4, 0.6])
+    parser.add_argument('--bold-ar1', type=float, nargs='+', default=[0.17])
+    parser.add_argument('--output', default='figure8_bsm_ppi')
+    parser.add_argument('--resume', action='store_true', help='Skip checkpointed condition chunks.')
+    args = parser.parse_args()
+    if min(args.reps, args.jobs, args.batch_size, args.condition_chunk) < 1:
+        parser.error('reps, jobs, batch-size and condition-chunk must be positive')
+    if args.n_subjects < 2 or args.n_trials < 3:
+        parser.error('At least 2 subjects and 3 trials required')
+    if any(x <= 0 for x in args.mean_iti + args.bold_snr + args.latent_snr):
+        parser.error('ITI and SNR must be positive')
+    if any(abs(x) >= 1 for x in args.bold_ar1):
+        parser.error('AR(1) coefficients must have magnitude below 1')
+    cfg = dict(tr=2.0, n_trials=args.n_trials, n_subjects=args.n_subjects,
+               trial_duration=1.0, hrf_delay_range=2.0,
+               microtime=args.microtime, ridge_alpha=args.ridge_alpha,
+               lss_method=args.lss_method)
+    hrfs = ['canonical','variable'] if args.hrf == 'both' else [args.hrf]
+    factors = itertools.product(hrfs, args.delta, args.bold_snr, args.latent_snr,
+                                args.mean_iti, args.source_effect, args.baseline_coupling,
+                                args.bold_ar1)
+    conditions = [dict(condition_id=i, hrf=h, delta=d, bold_snr=b,
+                       latent_snr=l, mean_iti=iti, source_effect=a,
+                       baseline_coupling=g, bold_ar1=rho)
+                  for i, (h,d,b,l,iti,a,g,rho) in enumerate(factors)]
+    from pathlib import Path
+    import json
+    import hashlib
+    outdir = Path(args.output + '_chunks')
+    outdir.mkdir(exist_ok=True, parents=True)
+    manifest = dict(seed=args.seed, reps=args.reps, n_subjects=args.n_subjects,
+                    n_trials=args.n_trials, microtime=args.microtime,
+                    ridge_alpha=args.ridge_alpha, lss_method=args.lss_method,
+                    tr=cfg['tr'], trial_duration=cfg['trial_duration'],
+                    hrf_delay_range=cfg['hrf_delay_range'], conditions=conditions)
+    manifest_text = json.dumps(manifest, sort_keys=True)
+    manifest_hash = hashlib.sha256(manifest_text.encode()).hexdigest()
+    manifest_path = outdir / 'manifest.json'
+    if args.resume and manifest_path.exists():
+        old = json.loads(manifest_path.read_text())
+        if old.get('hash') != manifest_hash:
+            parser.error('Existing checkpoint manifest does not match these parameters; choose a new --output')
+    elif any(outdir.glob('chunk_*.csv')):
+        parser.error('Output directory already has checkpoints; use --resume or a new --output')
+    manifest_path.write_text(json.dumps({'hash':manifest_hash, 'config':manifest}, indent=2))
+    print(f'{len(conditions)} conditions x {args.reps} repetitions; '
+          f'{len(conditions)*args.reps:,} experiments, 2 methods each', flush=True)
+    t0 = time.time()
+    for chunk_start in range(0, len(conditions), args.condition_chunk):
+        chunk = conditions[chunk_start:chunk_start + args.condition_chunk]
+        path = outdir / f'chunk_{chunk_start:06d}.csv'
+        if args.resume and path.exists():
+            print(f'Skipping {path.name}', flush=True)
+            continue
+        jobs = [(p, np.arange(st, min(st + args.batch_size, args.reps)))
+                for p in chunk for st in range(0, args.reps, args.batch_size)]
+        pieces = Parallel(n_jobs=args.jobs, verbose=0)(
+            delayed(run_batch)(p, cfg, indices, args.seed) for p, indices in jobs)
+        frame = pd.DataFrame([row for piece in pieces for row in piece])
+        temp = path.with_suffix('.tmp')
+        frame.to_csv(temp, index=False)
+        temp.replace(path)
+        print(f'Checkpointed conditions {chunk[0]["condition_id"]}-'
+              f'{chunk[-1]["condition_id"]}; elapsed {(time.time()-t0)/60:.1f} min', flush=True)
+    raw_path = Path(args.output + '_repetitions.csv')
+    summaries = []
+    with raw_path.open('w') as output_handle:
+        for i, path in enumerate(sorted(outdir.glob('chunk_*.csv'))):
+            df = pd.read_csv(path)
+            df.to_csv(output_handle, index=False, header=(i == 0))
+            cols = ['condition_id','hrf','delta','bold_snr','latent_snr','mean_iti',
+                    'source_effect','baseline_coupling','bold_ar1']
+            summaries.append(df.groupby(cols, as_index=False).agg(
+                n_reps=('rep','size'), bsm_rate=('bsm_reject','mean'),
+                ppi_rate=('ppi_reject','mean'), bsm_mean_t=('bsm_t','mean'),
+                ppi_mean_t=('ppi_t','mean'), bsm_mean_beta=('bsm_mean_beta','mean'),
+                ppi_mean_beta=('ppi_mean_beta','mean'),
+                realized_mean_iti=('realized_mean_iti','mean')))
+    summary = pd.concat(summaries, ignore_index=True)
+    for method in ('bsm','ppi'):
+        rate = summary[f'{method}_rate']
+        summary[f'{method}_rate_se'] = np.sqrt(rate*(1-rate)/summary.n_reps)
+    summary['paired_rate_difference'] = summary.bsm_rate - summary.ppi_rate
+    summary['rate_type'] = np.where(summary.delta == 0, 'false_positive_rate', 'power')
+    summary['n_subjects'] = args.n_subjects
+    summary['n_trials'] = args.n_trials
+    summary['ridge_alpha'] = args.ridge_alpha
+    summary['microtime'] = args.microtime
+    summary['lss_method'] = args.lss_method
+    summary.to_csv(args.output + '_summary.csv', index=False)
+    print(f'Finished in {(time.time()-t0)/60:.1f} minutes; '
+          f'saved {raw_path} and {args.output}_summary.csv', flush=True)
+
+
+if __name__ == '__main__':
+    main()
