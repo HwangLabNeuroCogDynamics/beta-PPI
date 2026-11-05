@@ -1,5 +1,5 @@
 # beta-PPI
-Code and examples for the paper: Estimating trial-wise modulation of functional connectivity using event-related fMRI 
+Code and examples for the paper: Estimating trial-wise modulation of functional connectivity using event-related fMRI. 
 
 ## Overview
 
@@ -9,7 +9,8 @@ The repository includes:
 
 * For the main simulation, check out simul.py.
 * For comparison with gPPI, check out gPPI_simul.py
-* For an example of how to implement this method for seed-based betaPPI, please see the example.py
+* For an example of how to implement this method for seed-based betaPPI, please see the example.py.
+* Please note we used Joblib for parallel simulations, up to 256 cores on our local computing server. Without it these simulations will take a very very long time.
 
 ## Software 
 
